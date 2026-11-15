@@ -3212,6 +3212,201 @@ def test_delete_memory_by_tag_no_matches(client, mock_state, auth_headers):
     assert data == {"status": "success", "tags": ["missing-tag"], "deleted_count": 0}
 
 
+def _seed_state_tag_memories(graph: FakeGraph, tag: str) -> dict[str, str]:
+    """Seed one memory per lifecycle state under ``tag``; returns ids keyed by state."""
+    now = datetime.now(timezone.utc)
+    past = (now - timedelta(days=1)).isoformat()
+    future = (now + timedelta(days=1)).isoformat()
+    states: dict[str, dict[str, Any]] = {
+        "current": {},
+        "archived": {"archived": True},
+        "not_yet_valid": {"t_valid": future},
+        "expired": {"t_invalid": past},
+        "invalidated": {},
+        "evolved": {},
+        "superseded_by_stale": {},
+        "replacement": {"tags": ["other-tag"]},
+        "stale_replacement": {"tags": ["other-tag"], "t_invalid": past},
+    }
+    ids: dict[str, str] = {}
+    for index, (state, extra) in enumerate(states.items()):
+        memory_id = f"00000000-0000-0000-0000-0000000005{index:02d}"
+        ids[state] = memory_id
+        graph.memories[memory_id] = {
+            "id": memory_id,
+            "content": f"{state} memory",
+            "tags": [tag],
+            "importance": 0.5,
+            "timestamp": past,
+            **extra,
+        }
+    for source, target, relation in (
+        ("invalidated", "replacement", "INVALIDATED_BY"),
+        ("evolved", "replacement", "EVOLVED_INTO"),
+        ("superseded_by_stale", "stale_replacement", "INVALIDATED_BY"),
+    ):
+        graph.relationships.append(
+            {"id1": ids[source], "id2": ids[target], "type": relation, "strength": 0.9}
+        )
+    return ids
+
+
+def test_memory_by_tag_default_lists_every_state(client, mock_state, auth_headers):
+    """Tag enumeration stays exhaustive by default for backward compatibility."""
+    ids = _seed_state_tag_memories(mock_state.memory_graph, "state-tag")
+
+    response = client.get("/memory/by-tag?tags=state-tag&limit=50", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["state_mode"] == "history"
+    assert "state_filter" not in data
+    expected = {ids[state] for state in ids if state not in {"replacement", "stale_replacement"}}
+    assert {memory["id"] for memory in data["memories"]} == expected
+
+
+@pytest.mark.parametrize("query", ["current_only=true", "state_mode=current"])
+def test_memory_by_tag_current_only_hides_non_current(client, mock_state, auth_headers, query):
+    """Current mode hides archived, future, expired, and actively superseded memories."""
+    ids = _seed_state_tag_memories(mock_state.memory_graph, "state-tag")
+
+    response = client.get(f"/memory/by-tag?tags=state-tag&limit=50&{query}", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["state_mode"] == "current"
+    # A memory superseded only by a stale replacement is still the current fact,
+    # matching recall (suppression requires an active replacement).
+    assert {memory["id"] for memory in data["memories"]} == {
+        ids["current"],
+        ids["superseded_by_stale"],
+    }
+    assert data["count"] == 2
+    assert data["has_more"] is False
+    assert data["state_filter"] == {"current_only": True, "suppressed_count": 5}
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_mode"),
+    [
+        ("state_mode=history", "history"),
+        ("current_only=false", "history"),
+        ("current_only=false&state_mode=current", "history"),
+        ("current_only=true&state_mode=history", "current"),
+    ],
+)
+def test_memory_by_tag_state_mode_precedence(
+    client, mock_state, auth_headers, query, expected_mode
+):
+    """``current_only`` wins over ``state_mode``, as on /recall."""
+    _seed_state_tag_memories(mock_state.memory_graph, "state-tag")
+
+    response = client.get(f"/memory/by-tag?tags=state-tag&limit=50&{query}", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["state_mode"] == expected_mode
+    assert data["count"] == (2 if expected_mode == "current" else 7)
+
+
+def test_memory_by_tag_rejects_invalid_state_mode(client, mock_state, auth_headers):
+    response = client.get(
+        "/memory/by-tag?tags=state-tag&state_mode=latest&current_only=true",
+        headers=auth_headers,
+    )
+    assert response.status_code == 400
+
+
+def test_memory_by_tag_current_only_pages_are_full(client, mock_state, auth_headers):
+    """Stale records interleaved in sort order never shorten pages or skew has_more."""
+    graph = mock_state.memory_graph
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    current_ids = []
+    for index in range(10):
+        memory_id = f"00000000-0000-0000-0000-0000000006{index:02d}"
+        stale = index % 2 == 1  # every other memory in importance order is stale
+        graph.memories[memory_id] = {
+            "id": memory_id,
+            "content": f"Interleaved memory {index}",
+            "tags": ["page-state"],
+            "importance": 1.0 - index * 0.05,
+            "timestamp": past,
+            **({"t_invalid": past} if stale else {}),
+        }
+        if not stale:
+            current_ids.append(memory_id)
+
+    pages = []
+    offset = 0
+    while True:
+        response = client.get(
+            f"/memory/by-tag?tags=page-state&current_only=true&limit=2&offset={offset}",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        pages.append(([memory["id"] for memory in data["memories"]], data["has_more"]))
+        if not data["has_more"]:
+            break
+        offset += 2
+
+    assert pages == [
+        (current_ids[0:2], True),
+        (current_ids[2:4], True),
+        (current_ids[4:5], False),
+    ]
+
+
+def test_memory_by_tag_current_only_rechecks_noncanonical_timestamps(
+    client, mock_state, auth_headers
+):
+    """Rows the string comparison keeps are re-checked with recall's timestamp parsing."""
+    graph = mock_state.memory_graph
+    # Expired an hour ago, but written with a +05:00 offset that sorts after "now".
+    expired_offset = (datetime.now(timezone.utc) - timedelta(hours=1)).astimezone(
+        timezone(timedelta(hours=5))
+    )
+    expired_id = "00000000-0000-0000-0000-000000000701"
+    current_id = "00000000-0000-0000-0000-000000000702"
+    for memory_id, extra in (
+        (expired_id, {"t_invalid": expired_offset.isoformat()}),
+        (current_id, {}),
+    ):
+        graph.memories[memory_id] = {
+            "id": memory_id,
+            "content": "Offset memory",
+            "tags": ["offset-state"],
+            "importance": 0.5,
+            "timestamp": utc_now(),
+            **extra,
+        }
+
+    response = client.get(
+        "/memory/by-tag?tags=offset-state&current_only=true", headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [memory["id"] for memory in data["memories"]] == [current_id]
+    assert data["state_filter"]["suppressed_count"] == 1
+
+
+def test_delete_memory_by_tag_ignores_state_filter(client, mock_state, auth_headers):
+    """Bulk delete removes every state, even when a state filter is passed."""
+    ids = _seed_state_tag_memories(mock_state.memory_graph, "state-tag")
+    tagged = {ids[state] for state in ids if state not in {"replacement", "stale_replacement"}}
+
+    response = client.delete(
+        "/memory/by-tag?tags=state-tag&current_only=true&state_mode=current",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["deleted_count"] == len(tagged)
+    assert tagged.isdisjoint(mock_state.memory_graph.memories)
+    assert ids["replacement"] in mock_state.memory_graph.memories
+
+
 # ==================== Test Admin Reembed ====================
 
 

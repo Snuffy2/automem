@@ -41,9 +41,15 @@ are not migrated by this change.
   - Response: `{ "status": "success", "memory_id": "..." }`
 
 - GET `/memory/by-tag?tags=foo&tags=bar&limit=20&offset=0`
-  - Response: `{ "status": "success", "tags": ["foo","bar"], "count": N, "limit": 20, "offset": 0, "has_more": false, "memories": [...] }`
+  - Exact, case-insensitive, any-of tag enumeration ordered by importance, then timestamp (newest first), then id.
+  - `state_mode=current|history` (or `current_only=true|false`) uses the same lifecycle rules and precedence as `/recall`: `current_only` wins when both are supplied, and a malformed `state_mode` is rejected with `400`. **Default: `history`** (every state is listed, as before), unlike `/recall`, which defaults to `current`.
+  - `current` hides memories that are archived, not yet valid (`t_valid` in the future), expired (`t_invalid` at or before now), or superseded by an `INVALIDATED_BY`/`EVOLVED_INTO` edge to a replacement that is itself current. The filter runs inside the graph query, so `limit`, `offset`, and `has_more` count only current memories and pages stay full. As in recall, one active supersession hop is enough to hide a memory; a replacement that is itself stale does not hide it.
+  - The query compares lifecycle timestamps as canonical UTC ISO strings, which is what every write path stores. Each returned row is then re-checked with recall's timestamp parser; a row with a non-canonical stored timestamp (for example a non-UTC offset from an old import) that fails that check is dropped, so such pages can be shorter than `limit`.
+  - Response: `{ "status": "success", "tags": ["foo","bar"], "count": N, "limit": 20, "offset": 0, "has_more": false, "state_mode": "history", "memories": [...] }`
+  - In `current` mode the response also includes `state_filter: { "current_only": true, "suppressed_count": S }`, where `S` is the number of memories matching the tags that the filter hides across the whole tag set (not only this page). Clients can detect support for the filter by the presence of `state_mode` in the response.
 
 - DELETE `/memory/by-tag?tags=foo&tags=bar`
+  - Deletes every memory matching any of the tags regardless of lifecycle state; `state_mode`/`current_only` are ignored.
   - Response: `{ "status": "success", "tags": ["foo","bar"], "deleted_count": N }`
 
 - POST `/associate`

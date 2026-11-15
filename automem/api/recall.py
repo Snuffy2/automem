@@ -1054,6 +1054,28 @@ def _parse_bool_param(raw: Any, default: bool = False) -> bool:
     return default
 
 
+def _resolve_state_mode(request_args: Any, *, default_current: bool) -> Tuple[bool, str]:
+    """Resolve ``current_only``/``state_mode`` request params into ``(current_only, mode)``.
+
+    ``state_mode`` is validated first (malformed values abort with 400 even when
+    ``current_only`` is also supplied). ``current_only`` then wins when present;
+    otherwise ``state_mode`` applies, and with neither the endpoint default is used.
+    A malformed ``current_only`` value falls back to ``default_current``.
+    """
+    state_mode_param = (request_args.get("state_mode") or "").strip().lower()
+    if state_mode_param and state_mode_param not in {"current", "history"}:
+        abort(400, description="'state_mode' must be 'current' or 'history'")
+
+    current_only_param = request_args.get("current_only")
+    if current_only_param is not None:
+        current_only = _parse_bool_param(current_only_param, default_current)
+    elif state_mode_param:
+        current_only = state_mode_param == "current"
+    else:
+        current_only = default_current
+    return current_only, "current" if current_only else "history"
+
+
 def _tokenize_lower(text: str) -> Set[str]:
     if not text:
         return set()
@@ -1975,20 +1997,7 @@ def handle_recall(
     recency_bias_mode = (
         recency_bias_param if recency_bias_param in {"auto", "on", "off"} else RECALL_RECENCY_BIAS
     )
-    state_mode_param = (request.args.get("state_mode") or "").strip().lower()
-    if state_mode_param and state_mode_param not in {"current", "history"}:
-        abort(400, description="'state_mode' must be 'current' or 'history'")
-
-    current_only_param = request.args.get("current_only")
-    if current_only_param is not None:
-        current_only = _parse_bool_param(current_only_param, True)
-        resolved_state_mode = "current" if current_only else "history"
-    elif state_mode_param:
-        resolved_state_mode = state_mode_param
-        current_only = resolved_state_mode == "current"
-    else:
-        current_only = True
-        resolved_state_mode = "current"
+    current_only, resolved_state_mode = _resolve_state_mode(request.args, default_current=True)
     state_debug = _parse_bool_param(request.args.get("state_debug"), False)
 
     # Entity expansion for multi-hop reasoning
