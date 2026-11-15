@@ -487,6 +487,56 @@ class FakeGraph:
                 if any(tag in tags for tag in memory_tags):
                     results.append(memory)
 
+            state_now = params.get("state_now")
+            if state_now is not None:
+                # Mirror the by-tag Cypher state filter, including its string
+                # timestamp comparison and one typed supersession hop.
+                def _cypher_current(node: Dict[str, Any]) -> bool:
+                    def _gt(value: Any) -> bool:
+                        return isinstance(value, str) and value > state_now
+
+                    def _le(value: Any) -> bool:
+                        return isinstance(value, str) and value <= state_now
+
+                    return not (
+                        node.get("archived") is True
+                        or _gt(node.get("t_valid"))
+                        or _le(node.get("t_invalid"))
+                    )
+
+                def _replacements(memory: Dict[str, Any]) -> List[Dict[str, Any]]:
+                    return [
+                        self.memories[rel["id2"]]
+                        for rel in self.relationships
+                        if rel.get("id1") == memory.get("id")
+                        and rel.get("type") in {"INVALIDATED_BY", "EVOLVED_INTO"}
+                        and rel.get("id2") in self.memories
+                    ]
+
+                def _row_current(memory: Dict[str, Any]) -> bool:
+                    return _cypher_current(memory) and not any(
+                        _cypher_current(rep) for rep in _replacements(memory)
+                    )
+
+                if "AS total" in query:
+                    current = sum(1 for memory in results if _row_current(memory))
+                    return FakeResult([[len(results), current]])
+
+                results = [memory for memory in results if _row_current(memory)]
+                results.sort(key=lambda memory: str(memory.get("id") or ""))
+                results.sort(key=lambda memory: str(memory.get("timestamp") or ""), reverse=True)
+                results.sort(
+                    key=lambda memory: float(memory.get("importance") or 0.0), reverse=True
+                )
+                offset = max(0, int(params.get("offset") or 0))
+                limit = int(params.get("limit_plus_one") or len(results))
+                return FakeResult(
+                    [
+                        [FakeNode(memory), [FakeNode(rep) for rep in _replacements(memory)]]
+                        for memory in results[offset : offset + limit]
+                    ]
+                )
+
             results.sort(key=lambda memory: str(memory.get("id") or ""))
             results.sort(key=lambda memory: str(memory.get("timestamp") or ""), reverse=True)
             results.sort(key=lambda memory: float(memory.get("importance") or 0.0), reverse=True)

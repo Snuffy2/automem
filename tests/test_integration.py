@@ -465,6 +465,81 @@ def test_tag_pagination_and_bulk_delete_real(api_client):
         pytest.fail("Deleted memories still surfaced in recall after bulk delete")
 
 
+def test_tag_enumeration_state_filter_real(api_client):
+    """by-tag current mode filters lifecycle state in FalkorDB with full pages."""
+    unique_tag = f"tagstate_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    past = (now - timedelta(days=1)).isoformat()
+    future = (now + timedelta(days=1)).isoformat()
+
+    def store(label: str, importance: float, tags: list, **extra) -> str:
+        response = api_client.post(
+            f"{api_client.base_url}/memory",
+            json={
+                "content": f"{label} {unique_tag}",
+                "tags": tags,
+                "importance": importance,
+                **extra,
+            },
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["memory_id"]
+
+    # Importance orders the tag set so stale records interleave with current ones.
+    current_a = store("current a", 0.95, [unique_tag])
+    expired = store("expired", 0.9, [unique_tag], t_invalid=past)
+    current_b = store("current b", 0.85, [unique_tag])
+    future_valid = store("future", 0.8, [unique_tag], t_valid=future)
+    invalidated = store("invalidated", 0.75, [unique_tag])
+    evolved = store("evolved", 0.7, [unique_tag])
+    current_c = store("current c", 0.65, [unique_tag])
+    replacement = store("replacement", 0.5, [f"{unique_tag}_other"])
+    all_ids = [current_a, expired, current_b, future_valid, invalidated, evolved, current_c]
+
+    for source, relation in ((invalidated, "INVALIDATED_BY"), (evolved, "EVOLVED_INTO")):
+        response = api_client.post(
+            f"{api_client.base_url}/associate",
+            json={
+                "memory1_id": source,
+                "memory2_id": replacement,
+                "type": relation,
+                "strength": 0.9,
+            },
+        )
+        assert response.status_code in {200, 201}, response.text
+
+    try:
+        history = api_client.get(
+            f"{api_client.base_url}/memory/by-tag", params={"tags": unique_tag, "limit": 50}
+        ).json()
+        assert history["state_mode"] == "history"
+        assert {memory["id"] for memory in history["memories"]} == set(all_ids)
+
+        pages = []
+        offset = 0
+        while True:
+            data = api_client.get(
+                f"{api_client.base_url}/memory/by-tag",
+                params={"tags": unique_tag, "limit": 2, "offset": offset, "current_only": "true"},
+            ).json()
+            assert data["state_mode"] == "current"
+            assert data["state_filter"] == {"current_only": True, "suppressed_count": 4}
+            pages.append(([memory["id"] for memory in data["memories"]], data["has_more"]))
+            if not data["has_more"]:
+                break
+            offset += 2
+        assert pages == [([current_a, current_b], True), ([current_c], False)]
+
+        deleted = api_client.delete(
+            f"{api_client.base_url}/memory/by-tag",
+            params={"tags": unique_tag, "current_only": "true"},
+        ).json()
+        assert deleted["deleted_count"] == len(all_ids)
+    finally:
+        for memory_id in [*all_ids, replacement]:
+            api_client.delete(f"{api_client.base_url}/memory/{memory_id}")
+
+
 def test_time_range_recall_real(api_client):
     """Test recalling memories within time ranges."""
     # Store a memory with current timestamp

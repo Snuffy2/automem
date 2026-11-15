@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from flask import Blueprint, abort, jsonify, request
 from flask.typing import ResponseReturnValue
 
+from automem.api.recall import (
+    STATE_SUPPRESSING_RELATIONS,
+    _resolve_state_mode,
+    _state_reason_for_memory,
+)
 from automem.api.stream import emit_event, preview_text
 from automem.config import (
     CLASSIFICATION_MODEL,
@@ -18,6 +24,7 @@ from automem.config import (
     normalize_memory_type,
 )
 from automem.stores.vector_payload import build_qdrant_payload
+from automem.utils.graph import _serialize_node
 from automem.utils.text import should_summarize_content, summarize_content
 
 
@@ -306,6 +313,53 @@ def _parse_by_tag_request(
     return tags, limit, offset
 
 
+_BY_TAG_MATCH = "ANY(tag IN coalesce(m.tags, []) WHERE toLower(tag) IN $tags)"
+_BY_TAG_ORDER = "ORDER BY m.importance DESC, m.timestamp DESC, m.id ASC"
+# One supersession hop, typed so FalkorDB only walks state edges.
+_BY_TAG_STATE_EDGES = "|".join(sorted(STATE_SUPPRESSING_RELATIONS))
+
+
+def _cypher_state_current(alias: str) -> str:
+    """Cypher mirror of recall's ``_state_reason_for_memory(...) is None``.
+
+    Timestamps are compared as strings against ``$state_now`` (canonical UTC ISO
+    from ``datetime.isoformat()``), which is the format every write path stores.
+    Each clause only excludes when the comparison is definitively true, so null
+    or type-mismatched values are kept and left to the exact Python re-check.
+    """
+    return (
+        f"NOT coalesce({alias}.archived = true, false)"
+        f" AND NOT coalesce({alias}.t_valid > $state_now, false)"
+        f" AND NOT coalesce({alias}.t_invalid <= $state_now, false)"
+    )
+
+
+def _by_tag_state_query(tail: str) -> str:
+    """Build a by-tag query that keeps only current memories, then appends ``tail``.
+
+    A memory is current when its own lifecycle fields are current and it has no
+    ``INVALIDATED_BY``/``EVOLVED_INTO`` edge to a current replacement, matching
+    recall's ``current_only`` semantics (recall suppresses on the first active hop).
+    """
+    return f"""
+        MATCH (m:Memory)
+        WHERE {_BY_TAG_MATCH}
+        OPTIONAL MATCH (m)-[:{_BY_TAG_STATE_EDGES}]->(replacement:Memory)
+        WITH m, collect(replacement) AS state_replacements
+        {tail}
+    """
+
+
+def _by_tag_row_is_current(memory: Dict[str, Any], replacements: List[Any], now: datetime) -> bool:
+    if _state_reason_for_memory(memory, now) is not None:
+        return False
+    return not any(
+        _state_reason_for_memory(_serialize_node(replacement), now) is None
+        for replacement in replacements or []
+        if replacement is not None
+    )
+
+
 def _load_memories_by_tag_page(
     *,
     graph: Any,
@@ -316,20 +370,47 @@ def _load_memories_by_tag_page(
     parse_metadata_field_fn: Callable[[Any], Any],
     logger: Any,
     abort_fn: Callable[..., Any],
-) -> tuple[List[Dict[str, Any]], bool]:
-    params = {
+    current_only: bool = False,
+    now: Optional[datetime] = None,
+) -> tuple[List[Dict[str, Any]], bool, int]:
+    """Load one page of memories matching any of ``tags``.
+
+    With ``current_only`` the state filter runs inside the query, so ``SKIP``,
+    ``LIMIT`` and ``has_more`` count only current memories. Returned rows are
+    re-checked with recall's exact timestamp parsing; the third return value is
+    the number of rows that check dropped (only possible for non-canonical stored
+    timestamps).
+
+    Returns:
+        ``(memories, has_more, dropped)``.
+    """
+    params: Dict[str, Any] = {
         "tags": [tag.lower() for tag in tags],
         "offset": offset,
         "limit_plus_one": limit + 1,
     }
-    query = """
-        MATCH (m:Memory)
-        WHERE ANY(tag IN coalesce(m.tags, []) WHERE toLower(tag) IN $tags)
-        RETURN m
-        ORDER BY m.importance DESC, m.timestamp DESC, m.id ASC
+    if current_only:
+        now = now or datetime.now(timezone.utc)
+        params["state_now"] = now.isoformat()
+        query = _by_tag_state_query(
+            f"""
+        WHERE {_cypher_state_current("m")}
+          AND size([x IN state_replacements WHERE {_cypher_state_current("x")}]) = 0
+        RETURN m, state_replacements
+        {_BY_TAG_ORDER}
         SKIP $offset
         LIMIT $limit_plus_one
-    """
+            """
+        )
+    else:
+        query = f"""
+            MATCH (m:Memory)
+            WHERE {_BY_TAG_MATCH}
+            RETURN m
+            {_BY_TAG_ORDER}
+            SKIP $offset
+            LIMIT $limit_plus_one
+        """
     try:
         result = graph.query(query, params)
     except Exception:
@@ -339,12 +420,50 @@ def _load_memories_by_tag_page(
     rows = list(getattr(result, "result_set", []) or [])
     has_more = len(rows) > limit
     memories: List[Dict[str, Any]] = []
+    dropped = 0
     for row in rows[:limit]:
         data = serialize_node_fn(row[0])
+        if current_only and now is not None:
+            replacements = row[1] if len(row) > 1 else []
+            if not _by_tag_row_is_current(data, replacements, now):
+                dropped += 1
+                continue
         data["metadata"] = parse_metadata_field_fn(data.get("metadata"))
         memories.append(data)
 
-    return memories, has_more
+    return memories, has_more, dropped
+
+
+def _count_suppressed_by_tag(
+    *,
+    graph: Any,
+    tags: List[str],
+    now: datetime,
+    logger: Any,
+    abort_fn: Callable[..., Any],
+) -> int:
+    """Count tag matches hidden by the current-state filter across the whole tag set."""
+    query = _by_tag_state_query(
+        f"""
+        RETURN count(m) AS total,
+               sum(CASE
+                   WHEN {_cypher_state_current("m")}
+                    AND size([x IN state_replacements WHERE {_cypher_state_current("x")}]) = 0
+                   THEN 1 ELSE 0 END) AS current
+        """
+    )
+    params = {"tags": [tag.lower() for tag in tags], "state_now": now.isoformat()}
+    try:
+        result = graph.query(query, params)
+    except Exception:
+        logger.exception("Tag state count failed")
+        abort_fn(500, description="Failed to search by tag")
+
+    rows = list(getattr(result, "result_set", []) or [])
+    if not rows:
+        return 0
+    total, current = rows[0][0] or 0, rows[0][1] or 0
+    return max(0, int(total) - int(current))
 
 
 def _delete_qdrant_points(
@@ -1097,7 +1216,8 @@ def create_memory_blueprint_full(
         if request.method == "DELETE":
             deleted_count = 0
             while True:
-                memories, _ = _load_memories_by_tag_page(
+                # Deliberately unfiltered: bulk delete removes every state.
+                memories, _, _ = _load_memories_by_tag_page(
                     graph=graph,
                     tags=tags,
                     limit=200,
@@ -1136,7 +1256,11 @@ def create_memory_blueprint_full(
             )
             return jsonify({"status": "success", "tags": tags, "deleted_count": deleted_count})
 
-        memories, has_more = _load_memories_by_tag_page(
+        # Backward-compatible default: tag enumeration lists every state unless
+        # the caller opts into current-only (recall's default is current).
+        current_only, state_mode = _resolve_state_mode(request.args, default_current=False)
+        now = datetime.now(timezone.utc)
+        memories, has_more, dropped = _load_memories_by_tag_page(
             graph=graph,
             tags=tags,
             limit=limit,
@@ -1145,7 +1269,15 @@ def create_memory_blueprint_full(
             parse_metadata_field_fn=parse_metadata_field,
             logger=logger,
             abort_fn=abort,
+            current_only=current_only,
+            now=now,
         )
+        state_filter: Optional[Dict[str, Any]] = None
+        if current_only:
+            suppressed = _count_suppressed_by_tag(
+                graph=graph, tags=tags, now=now, logger=logger, abort_fn=abort
+            )
+            state_filter = {"current_only": True, "suppressed_count": suppressed + dropped}
 
         if on_access and memories:
             accessed_ids = [str(m.get("id")) for m in memories if m.get("id")]
@@ -1163,6 +1295,8 @@ def create_memory_blueprint_full(
                 "limit": limit,
                 "offset": offset,
                 "has_more": has_more,
+                "state_mode": state_mode,
+                **({"state_filter": state_filter} if state_filter is not None else {}),
                 "memories": memories,
             }
         )
