@@ -3,6 +3,7 @@
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from queue import Queue
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
@@ -17,6 +18,7 @@ from app import _normalize_timestamp, utc_now
 from automem import config
 from automem.api import recall as recall_module
 from automem.api.recall import _expand_related_memories, handle_recall
+from automem.embedding.runtime_helpers import generate_placeholder_embedding
 from automem.utils import scoring
 from automem.utils.scoring import _compute_metadata_score, _compute_recency_score
 from automem.utils.text import _extract_keywords
@@ -30,6 +32,7 @@ class MockQdrantClient:
     def __init__(self):
         self.points = {}
         self.upsert_calls = []
+        self.set_payload_calls = []
         self.search_calls = []
         self.delete_calls = []
 
@@ -67,6 +70,13 @@ class MockQdrantClient:
                 results.append(mock_point)
         return results
 
+    def set_payload(self, collection_name, payload, points):
+        """Mock set_payload: merge keys into existing points' payloads."""
+        self.set_payload_calls.append((collection_name, payload, list(points)))
+        for point_id in points:
+            if point_id in self.points:
+                self.points[point_id]["payload"] = {**self.points[point_id]["payload"], **payload}
+
     def delete(self, collection_name, points_selector):
         """Mock delete operation."""
         self.delete_calls.append((collection_name, points_selector))
@@ -88,13 +98,17 @@ class MockQdrantClient:
         with_payload=True,
         with_vectors=False,
     ):
-        """Mock scroll to support tag-only queries."""
-        _ = offset, with_vectors
+        """Mock scroll to support tag-only queries and vector scans."""
+        _ = offset
         matches = []
         for point_id, point in self.points.items():
             payload = point["payload"]
             if self._filter_matches(payload, scroll_filter):
-                mock_point = SimpleNamespace(id=point_id, payload=payload)
+                mock_point = SimpleNamespace(
+                    id=point_id,
+                    payload=payload,
+                    vector=point["vector"] if with_vectors else None,
+                )
                 matches.append(mock_point)
             if len(matches) >= limit:
                 break
@@ -3329,6 +3343,68 @@ def test_admin_reembed_counts_placeholder_provider_as_failed(client, mock_state,
     assert mock_state.embedding_provider.batch_calls == []
 
 
+def test_admin_reembed_placeholder_only_repairs_placeholder_points(
+    client, mock_state, admin_headers
+):
+    """placeholder_only re-embeds hash-placeholder points and leaves real vectors alone."""
+    mock_state.openai_client = None
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = FakeEmbeddingProvider([[0.5] * 768])
+
+    placeholder_id = "abababab-abab-abab-abab-abababababab"
+    real_id = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"
+    placeholder_content = "Stored while the provider was down"
+    real_vector = [0.9] * 768
+    for memory_id, content, vector in [
+        (
+            placeholder_id,
+            placeholder_content,
+            generate_placeholder_embedding(placeholder_content, 768),
+        ),
+        (real_id, "Embedded normally", real_vector),
+    ]:
+        mock_state.memory_graph.memories[memory_id] = {
+            "id": memory_id,
+            "content": content,
+            "tags": ["test"],
+        }
+        mock_state.qdrant.points[memory_id] = {"vector": vector, "payload": {"content": content}}
+
+    response = client.post("/admin/reembed", json={"placeholder_only": True}, headers=admin_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "complete"
+    assert data["placeholder_only"] is True
+    assert data["placeholder_points"] == 1
+    assert data["processed"] == 1
+    assert mock_state.embedding_provider.batch_calls == [[placeholder_content]]
+    assert mock_state.qdrant.points[placeholder_id]["vector"] == [0.5] * 768
+    assert mock_state.qdrant.points[real_id]["vector"] == real_vector
+
+
+def test_admin_reembed_placeholder_only_noop_without_placeholders(
+    client, mock_state, admin_headers
+):
+    """placeholder_only does not touch the provider when no placeholder points exist."""
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = FakeEmbeddingProvider([])
+    memory_id = "efefefef-efef-efef-efef-efefefefefef"
+    mock_state.memory_graph.memories[memory_id] = {"id": memory_id, "content": "Real one"}
+    mock_state.qdrant.points[memory_id] = {
+        "vector": [0.9] * 768,
+        "payload": {"content": "Real one"},
+    }
+
+    response = client.post("/admin/reembed", json={"placeholder_only": True}, headers=admin_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["processed"] == 0
+    assert data["total"] == 0
+    assert mock_state.embedding_provider.batch_calls == []
+
+
 def test_admin_sync_uses_embedding_provider_without_openai(client, mock_state, admin_headers):
     """Test sync embeds missing memories through the configured provider."""
     mock_state.openai_client = None
@@ -4239,6 +4315,120 @@ def test_create_association_encodes_map_property_values(client, mock_state, auth
     assert row["props"]["observations"] == ["plain", json.dumps({"x-y": 2})]
     # Rows and props are maps with server-chosen keys; no caller-supplied map remains.
     assert _map_param_paths(list(row["props"].values())) == []
+
+
+def _queued_embedding_ids(state):
+    jobs = []
+    while not state.embedding_queue.empty():
+        jobs.append(state.embedding_queue.get_nowait()[0])
+    return jobs
+
+
+def test_batch_store_provider_failure_queues_instead_of_placeholder(
+    client, mock_state, auth_headers
+):
+    """A failing real provider must not leave placeholder vectors in Qdrant."""
+    mock_state.embedding_provider = FailingEmbeddingProvider()
+    mock_state.effective_vector_size = config.VECTOR_SIZE
+    mock_state.embedding_queue = Queue()
+
+    response = client.post(
+        "/memory/batch",
+        json={"memories": [{"content": "first batch item"}, {"content": "second batch item"}]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    memory_ids = response.get_json()["memory_ids"]
+    assert mock_state.qdrant.upsert_calls == []
+    assert mock_state.qdrant.points == {}
+    assert _queued_embedding_ids(mock_state) == memory_ids
+
+
+def test_batch_store_partial_provider_failure_stores_real_and_queues_rest(
+    client, mock_state, auth_headers
+):
+    """Items the provider embedded are stored; only the failed ones are queued."""
+    real_vector = [0.4] * config.VECTOR_SIZE
+
+    class PartialProvider(FailingEmbeddingProvider):
+        def generate_embedding(self, text):
+            self.single_calls.append(text)
+            if text == "provider rejects this":
+                raise RuntimeError("item failed")
+            return real_vector
+
+    mock_state.embedding_provider = PartialProvider()
+    mock_state.effective_vector_size = config.VECTOR_SIZE
+    mock_state.embedding_queue = Queue()
+
+    response = client.post(
+        "/memory/batch",
+        json={
+            "memories": [{"content": "provider embeds this"}, {"content": "provider rejects this"}]
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    stored_id, failed_id = response.get_json()["memory_ids"]
+    assert mock_state.qdrant.points[stored_id]["vector"] == real_vector
+    assert failed_id not in mock_state.qdrant.points
+    assert _queued_embedding_ids(mock_state) == [failed_id]
+
+
+def test_batch_store_configured_placeholder_provider_still_stores(client, mock_state, auth_headers):
+    """An operator-selected placeholder provider keeps writing vectors directly."""
+    vector = [0.7] * config.VECTOR_SIZE
+    mock_state.embedding_provider = PlaceholderNamedEmbeddingProvider([vector])
+    mock_state.effective_vector_size = config.VECTOR_SIZE
+    mock_state.embedding_queue = Queue()
+
+    response = client.post(
+        "/memory/batch",
+        json={"memories": [{"content": "placeholder configured on purpose"}]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    [memory_id] = response.get_json()["memory_ids"]
+    assert mock_state.qdrant.points[memory_id]["vector"] == vector
+    assert mock_state.embedding_queue.empty()
+
+
+def test_patch_content_provider_failure_refreshes_payload_and_queues(
+    client, mock_state, auth_headers
+):
+    """PATCH keeps the real vector, refreshes the payload and queues re-embedding."""
+    memory_id = "12121212-1212-1212-1212-121212121212"
+    old_vector = [0.2] * config.VECTOR_SIZE
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "old content",
+        "tags": ["before"],
+        "importance": 0.5,
+    }
+    mock_state.qdrant.points[memory_id] = {
+        "vector": old_vector,
+        "payload": {"content": "old content", "tags": ["before"]},
+    }
+    mock_state.embedding_provider = FailingEmbeddingProvider()
+    mock_state.effective_vector_size = config.VECTOR_SIZE
+    mock_state.embedding_queue = Queue()
+
+    response = client.patch(
+        f"/memory/{memory_id}",
+        json={"content": "new content", "tags": ["after"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert mock_state.qdrant.upsert_calls == []
+    point = mock_state.qdrant.points[memory_id]
+    assert point["vector"] == old_vector
+    assert point["payload"]["content"] == "new content"
+    assert point["payload"]["tags"] == ["after"]
+    assert mock_state.embedding_queue.get_nowait() == (memory_id, "new content")
 
 
 def test_invalid_json_payload(client, mock_state, auth_headers):

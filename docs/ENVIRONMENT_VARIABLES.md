@@ -659,9 +659,19 @@ backup. `/admin/sync` only repairs missing points, so it cannot backfill payload
 fields on existing points. Reembedding preserves archived/expired state and
 recomputes prefixes from graph tags.
 
-Background retries suppress automatic placeholder fallback after a real provider
-fails, allowing the failure to be retried and counted. An explicitly configured
-`EMBEDDING_PROVIDER=placeholder` continues to work for local/dev installations.
+Background retries, `POST /memory/batch`, and content edits through
+`PATCH /memory/<id>` suppress automatic placeholder fallback after a real
+provider fails. The batch endpoint stores the vectors the provider did return and
+queues the remaining memories for the background worker; a PATCH keeps the
+existing vector, refreshes the point's payload and queues the new text. An
+explicitly configured `EMBEDDING_PROVIDER=placeholder` continues to work for
+local/dev installations.
+
+Older releases could store hash-based placeholder vectors from `POST /memory/batch`
+when the provider failed. Placeholder vectors are a deterministic function of the
+point's `content`, so they can be found without a payload marker. Repair only those
+points with `POST /admin/reembed` and `{"placeholder_only": true}`, or
+`scripts/reembed_embeddings.py --placeholder-only`; real embeddings are left alone.
 
 The background worker checks graph content before storage and again after Qdrant
 confirms the write. A content change invalidates that vector and retries with the

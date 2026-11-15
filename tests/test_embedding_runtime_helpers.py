@@ -8,10 +8,16 @@ search.
 """
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
-from automem.embedding.runtime_helpers import generate_real_embeddings_batch
+from automem.embedding.runtime_helpers import (
+    generate_placeholder_embedding,
+    generate_real_embeddings_batch,
+    is_placeholder_vector,
+)
+from automem.stores.placeholder_points import find_placeholder_point_ids
 
 DIM = 4
 
@@ -300,6 +306,69 @@ def test_no_provider_uses_placeholders(caplog):
             placeholder_embedding=_placeholder,
         )
     assert result == [_placeholder("alpha"), _placeholder("bravo!")]
+
+
+def test_strict_partial_returns_none_for_failed_items_only(caplog):
+    """Strict partial mode keeps real vectors and marks failures None, never placeholders."""
+
+    class Provider:
+        def provider_name(self):
+            return "voyage:voyage-4"
+
+        def generate_embeddings_batch(self, contents):
+            raise RuntimeError("batch endpoint down")
+
+        def generate_embedding(self, content):
+            if content == "bad":
+                raise RuntimeError("item failed")
+            return _real_vector(content)
+
+    with caplog.at_level(logging.DEBUG):
+        result = generate_real_embeddings_batch(
+            ["good", "bad"],
+            init_embedding_provider=lambda: None,
+            state=_State(Provider()),
+            logger=logger,
+            placeholder_embedding=_placeholder,
+            allow_placeholder_fallback=False,
+            allow_partial=True,
+        )
+
+    assert result == [_real_vector("good"), None]
+    assert any("could not be embedded" in m for m in _warning_messages(caplog))
+
+
+def test_placeholder_vector_detection_survives_normalization():
+    content = "legacy batch memory"
+    vector = generate_placeholder_embedding(content, 16)
+    norm = sum(v * v for v in vector) ** 0.5
+
+    assert is_placeholder_vector(vector, content)
+    assert is_placeholder_vector([v / norm for v in vector], content)
+    assert not is_placeholder_vector(vector, "different content")
+    assert not is_placeholder_vector([0.5] * 16, content)
+
+
+def test_find_placeholder_point_ids_scans_every_page():
+    placeholder = SimpleNamespace(
+        id="p1",
+        payload={"content": "alpha"},
+        vector=generate_placeholder_embedding("alpha", 8),
+    )
+    real = SimpleNamespace(id="r1", payload={"content": "bravo"}, vector=[0.3] * 8)
+    later = SimpleNamespace(
+        id="p2",
+        payload={"content": "charlie"},
+        vector={"": generate_placeholder_embedding("charlie", 8)},
+    )
+    pages = {None: ([placeholder, real], "next"), "next": ([later], None)}
+
+    class Client:
+        def scroll(self, *, collection_name, limit, offset, with_payload, with_vectors):
+            assert with_vectors is True
+            return pages[offset]
+
+    assert find_placeholder_point_ids(Client(), "memories") == ["p1", "p2"]
 
 
 if __name__ == "__main__":

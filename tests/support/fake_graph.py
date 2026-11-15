@@ -512,7 +512,14 @@ class FakeGraph:
             and "m.content AS content" in query
         ):
             rows = []
+            id_filter = (
+                {str(memory_id) for memory_id in params.get("ids") or []}
+                if "m.id IN $ids" in query
+                else None
+            )
             for memory_id, memory in self.memories.items():
+                if id_filter is not None and memory_id not in id_filter:
+                    continue
                 if memory.get("content"):
                     rows.append(
                         [

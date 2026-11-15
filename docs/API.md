@@ -176,8 +176,9 @@ Admin
 
 - POST `/admin/reembed`
   - Headers: requires both API and Admin tokens.
-  - Body: `{ "batch_size": 32, "limit": 100, "force": false }`
-  - Response: `{ "status": "complete", "processed": N, "failed": K }`
+  - Body: `{ "batch_size": 32, "limit": 100, "force": false, "placeholder_only": false }`
+  - `placeholder_only: true` scans Qdrant and re-embeds only memories whose stored vector is the deterministic hash placeholder for its content.
+  - Response: `{ "status": "complete", "processed": N, "failed": K }`; with `placeholder_only`, also `placeholder_only: true` and `placeholder_points`.
 
 Consolidation
 
