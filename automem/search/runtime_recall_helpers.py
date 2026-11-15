@@ -108,14 +108,21 @@ MAX_METADATA_ARRAY_LENGTH = 12
 
 
 def _embed_query(embed_fn: Callable[..., List[float]], text: str) -> List[float]:
-    """Embed a recall query, passing query=True when the embedder accepts it."""
+    """Embed a recall query with ``query=True`` and ``strict=True`` when accepted.
+
+    Strict mode makes a failed provider call raise ``EmbeddingUnavailableError``
+    instead of returning a placeholder vector that would match arbitrary memories.
+    """
     try:
         params = inspect.signature(embed_fn).parameters
     except (TypeError, ValueError):
         params = {}
+    kwargs: Dict[str, Any] = {}
     if "query" in params:
-        return embed_fn(text, query=True)
-    return embed_fn(text)
+        kwargs["query"] = True
+    if "strict" in params:
+        kwargs["strict"] = True
+    return embed_fn(text, **kwargs)
 
 
 def _normalize_tags(tags: List[Any]) -> List[str]:
@@ -1169,6 +1176,8 @@ def _vector_search(
             abort(400, description=str(exc))
     elif normalized:
         logger.debug("Generating embedding for recall query")
+        # EmbeddingUnavailableError propagates so the recall route can skip
+        # the vector leg and report it instead of searching with a placeholder.
         embedding = _embed_query(generate_real_embedding, normalized)
 
     if not embedding:

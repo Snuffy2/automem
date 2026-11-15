@@ -53,10 +53,13 @@ def create_app_helper_runtime(
             content, get_state_fn().effective_vector_size
         )
 
-    def generate_real_embedding(content: str, *, query: bool = False) -> List[float]:
+    def generate_real_embedding(
+        content: str, *, query: bool = False, strict: bool = False
+    ) -> List[float]:
         return generate_real_embedding_value_fn(
             content,
             query=query,
+            strict=strict,
             init_embedding_provider=init_embedding_provider_fn,
             state=get_state_fn(),
             logger=logger,

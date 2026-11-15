@@ -29,6 +29,7 @@ from automem.config import (
     expand_relation_query_types,
     normalize_relation_type,
 )
+from automem.embedding.runtime_helpers import EmbeddingUnavailableError
 from automem.search.runtime_recall_helpers import _hydrate_vector_relations
 from automem.utils.graph import _serialize_node
 from automem.utils.time import _parse_iso_datetime, query_has_temporal_intent, utc_now
@@ -944,6 +945,9 @@ def _apply_scope_fallback(
             tag_mode,
             tag_match,
         )
+    except EmbeddingUnavailableError as exc:
+        logger.warning("Scope-fallback vector search skipped: query embedding failed: %s", exc)
+        return []
     except Exception:
         logger.exception("Scope-fallback vector search failed")
         return []
@@ -2106,6 +2110,8 @@ def handle_recall(
         mid = str(result.get("id") or mem.get("id") or mem.get("memory_id") or "")
         return (primary, secondary, mid)
 
+    vector_skip_reasons: Set[str] = set()
+
     def _run_single_query(
         query_str: str, per_query_limit: int
     ) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], int]:
@@ -2144,17 +2150,25 @@ def handle_recall(
                     per_query_limit,
                     min(max(vector_fetch_limit, recall_max_limit), RECALL_VECTOR_FETCH_CAP),
                 )
-            vector_matches = vector_search(
-                qdrant_client,
-                graph,
-                query_str,
-                embedding_param,
-                vector_fetch_limit,
-                vector_seen,
-                tag_filters,
-                tag_mode,
-                tag_match,
-            )
+            try:
+                vector_matches = vector_search(
+                    qdrant_client,
+                    graph,
+                    query_str,
+                    embedding_param,
+                    vector_fetch_limit,
+                    vector_seen,
+                    tag_filters,
+                    tag_mode,
+                    tag_match,
+                )
+            except EmbeddingUnavailableError as exc:
+                # The provider failed to embed the query (e.g. rate limited).
+                # Skip the vector leg rather than search with a meaningless
+                # placeholder vector; keyword/metadata/graph legs still run.
+                logger.warning("Recall vector search skipped: query embedding failed: %s", exc)
+                vector_skip_reasons.add("embedding_failed")
+                vector_matches = []
             if start_time or end_time or tag_filters or exclude_tags:
                 vector_matches = [
                     res
@@ -2743,6 +2757,8 @@ def handle_recall(
             "matched": bool(total_vector_matches),
         },
     }
+    if vector_skip_reasons:
+        response["vector_search"]["skipped_reason"] = sorted(vector_skip_reasons)[0]
 
     def _returned_expansion_count(candidates: List[Dict[str, Any]]) -> int:
         candidate_ids = {_result_memory_id(candidate) for candidate in candidates} - {""}
