@@ -55,6 +55,10 @@ def generate_placeholder_embedding(content: str, expected_dim: int) -> List[floa
     return [rng.random() for _ in range(expected_dim)]
 
 
+class EmbeddingUnavailableError(RuntimeError):
+    """Raised in strict mode when the configured provider cannot embed the content."""
+
+
 def generate_real_embedding(
     content: str,
     *,
@@ -63,8 +67,28 @@ def generate_real_embedding(
     logger: Any,
     placeholder_embedding: Callable[[str], List[float]],
     query: bool = False,
+    strict: bool = False,
 ) -> List[float]:
-    """Generate an embedding using the configured provider (query=True for search queries)."""
+    """Generate an embedding using the configured provider.
+
+    Args:
+        content: Text to embed.
+        init_embedding_provider: Initializes ``state.embedding_provider`` if needed.
+        state: Runtime state holding the provider and effective vector size.
+        logger: Logger for fallback warnings.
+        placeholder_embedding: Hash-based fallback embedder.
+        query: Embed as a search query when the provider supports it.
+        strict: Raise ``EmbeddingUnavailableError`` instead of returning a
+            placeholder vector when the configured provider fails or returns
+            the wrong dimension. A deliberately configured placeholder
+            provider, or no provider at all, still returns a placeholder vector.
+
+    Returns:
+        The embedding vector.
+
+    Raises:
+        EmbeddingUnavailableError: In strict mode, when the provider fails.
+    """
     init_embedding_provider()
 
     if state.embedding_provider is None:
@@ -85,10 +109,19 @@ def generate_real_embedding(
                 len(embedding) if isinstance(embedding, list) else "invalid",
                 expected_dim,
             )
+            if strict:
+                raise EmbeddingUnavailableError(
+                    f"provider returned an embedding with the wrong dimension "
+                    f"(expected {expected_dim})"
+                )
             return placeholder_embedding(content)
         return embedding
+    except EmbeddingUnavailableError:
+        raise
     except Exception as exc:
         logger.warning("Failed to generate embedding: %s", str(exc))
+        if strict:
+            raise EmbeddingUnavailableError(str(exc)) from exc
         return placeholder_embedding(content)
 
 
