@@ -597,3 +597,20 @@ ADMIN_TOKEN = os.getenv("ADMIN_API_TOKEN")
 # Bounded background embedding retries (initial attempt included).
 EMBEDDING_MAX_ATTEMPTS = max(1, int(os.getenv("EMBEDDING_MAX_ATTEMPTS", "3")))
 EMBEDDING_RETRY_BACKOFF_SECONDS = max(0.0, float(os.getenv("EMBEDDING_RETRY_BACKOFF_SECONDS", "1")))
+
+# Voyage rate-limit handling, shared by every Voyage call in the process
+# (recall query embeddings, batch store, background embedding worker).
+# Retries after the initial request for 429 and 5xx responses.
+VOYAGE_MAX_RETRIES = max(0, int(os.getenv("VOYAGE_MAX_RETRIES", "2")))
+# Upper bound for any single wait: a Retry-After value, an exponential backoff
+# step, or the shared cooldown set after a 429.
+VOYAGE_RETRY_MAX_DELAY_SECONDS = max(0.0, float(os.getenv("VOYAGE_RETRY_MAX_DELAY_SECONDS", "30")))
+# Total time one call may spend waiting (cooldown, pacing, and backoff) before
+# it gives up. Recall query embeddings use the shorter query budget so the
+# request path fails fast instead of blocking a request thread.
+VOYAGE_MAX_RETRY_WAIT_SECONDS = max(0.0, float(os.getenv("VOYAGE_MAX_RETRY_WAIT_SECONDS", "20")))
+VOYAGE_QUERY_MAX_RETRY_WAIT_SECONDS = max(
+    0.0, float(os.getenv("VOYAGE_QUERY_MAX_RETRY_WAIT_SECONDS", "3"))
+)
+# Optional process-wide request pacing; 0 disables it.
+VOYAGE_REQUESTS_PER_MINUTE = max(0.0, float(os.getenv("VOYAGE_REQUESTS_PER_MINUTE", "0")))

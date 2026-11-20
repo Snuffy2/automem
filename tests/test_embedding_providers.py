@@ -476,24 +476,33 @@ def test_voyage_provider_retries_transient_http_errors(status_code):
     success_response.status_code = 200
     success_response.json.return_value = {"data": [{"embedding": [0.2] * 1024}]}
 
+    from automem.embedding.voyage import VoyageEmbeddingProvider, VoyageRateLimiter
+
+    clock = {"now": 0.0}
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    limiter = VoyageRateLimiter(clock=lambda: clock["now"], sleep=fake_sleep, rng=lambda: 0.0)
+
     with patch("automem.embedding.voyage.httpx.Client") as mock_httpx_client_class:
-        with patch("automem.embedding.voyage.time.sleep") as mock_sleep:
-            mock_httpx_client = Mock()
-            mock_httpx_client.post.side_effect = [transient_response, success_response]
-            mock_httpx_client_class.return_value = mock_httpx_client
+        mock_httpx_client = Mock()
+        mock_httpx_client.post.side_effect = [transient_response, success_response]
+        mock_httpx_client_class.return_value = mock_httpx_client
 
-            from automem.embedding.voyage import VoyageEmbeddingProvider
+        provider = VoyageEmbeddingProvider(
+            api_key="voyage-test-key",
+            dimension=1024,
+            max_retries=2,
+            rate_limiter=limiter,
+        )
+        embedding = provider.generate_embedding("retry me")
 
-            provider = VoyageEmbeddingProvider(
-                api_key="voyage-test-key",
-                dimension=1024,
-                max_retries=2,
-            )
-            embedding = provider.generate_embedding("retry me")
-
-            assert len(embedding) == 1024
-            assert mock_httpx_client.post.call_count == 2
-            mock_sleep.assert_called_once_with(1)
+        assert len(embedding) == 1024
+        assert mock_httpx_client.post.call_count == 2
+        assert sleeps == [0.5]
 
 
 @patch("automem.embedding.voyage.httpx.Client")

@@ -77,6 +77,11 @@ AutoMem supports five embedding backends with automatic fallback.
 | `VOYAGE_API_KEY` | Voyage API key (for Voyage provider) | - | `pa-...` |
 | `VOYAGE_MODEL` | Voyage embedding model | `voyage-4` | `voyage-4`, `voyage-4-large`, `voyage-4-lite` |
 | `VOYAGE_INPUT_TYPES` | Voyage `input_type` roles. `query` (default) sends `input_type=query` on recall only and works on existing stores with no re-embed. `off` sends no `input_type`. `both` also embeds stored memories as `document`; switching an existing store to or from `both` requires a full re-embed (`scripts/reembed_embeddings.py`) | `query` | `query`, `off`, `both` |
+| `VOYAGE_MAX_RETRIES` | Retries after the first Voyage request for 429, 5xx, and network errors | `2` | `0`, `2`, `4` |
+| `VOYAGE_RETRY_MAX_DELAY_SECONDS` | Cap on any single Voyage wait: a `Retry-After` value, a backoff step, or the shared 429 cooldown | `30` | `10`, `30`, `60` |
+| `VOYAGE_MAX_RETRY_WAIT_SECONDS` | Total seconds one Voyage call (store, batch, background embedding) may spend waiting on cooldown, pacing, and backoff before it fails | `20` | `5`, `20`, `60` |
+| `VOYAGE_QUERY_MAX_RETRY_WAIT_SECONDS` | Wait budget for recall query embeddings, so a rate-limited recall fails fast instead of blocking a request thread | `3` | `0`, `3`, `10` |
+| `VOYAGE_REQUESTS_PER_MINUTE` | Optional process-wide pacing for all Voyage requests; `0` disables it | `0` | `0`, `60`, `300` |
 | `OPENAI_API_KEY` | API key (OpenAI or compatible provider) | - | `sk-proj-...` |
 | `OPENAI_BASE_URL` | Custom base URL for OpenAI-compatible APIs (embeddings and classification/enrichment LLM calls) | - | `https://openrouter.ai/api/v1` |
 | `OLLAMA_BASE_URL` | Ollama API base URL | `http://localhost:11434` | `http://localhost:11434` |
@@ -138,6 +143,7 @@ Set `OLLAMA_BASE_URL` when the Ollama server is not at `http://localhost:11434`.
 - Voyage 4 family supports output dimensions `256`, `512`, `1024`, or `2048`
 - Set `VECTOR_SIZE` to one of the supported Voyage dimensions
 - Voyage's free tier covers typical AutoMem usage. See the maintained [Voyage pricing page](https://docs.voyageai.com/docs/pricing) for current limits and rates.
+- Rate limits: every Voyage call in the process shares one limiter. A 429 starts a cooldown that all callers wait out, using `Retry-After` (seconds or HTTP date) when present and jittered exponential backoff otherwise. 5xx responses back off per call. A call that would wait longer than its budget (`VOYAGE_MAX_RETRY_WAIT_SECONDS`, or `VOYAGE_QUERY_MAX_RETRY_WAIT_SECONDS` for recall queries) fails immediately. Set `VOYAGE_REQUESTS_PER_MINUTE` below your Voyage account limit to pace requests before Voyage rejects them.
 
 **OpenAI-Compatible Providers (OpenRouter, LiteLLM, Azure, vLLM, etc.):**
 
