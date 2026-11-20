@@ -33,14 +33,15 @@ def run_consolidation_tick(
             affected_count = 0
 
             if "decay" in steps:
-                affected_count += steps["decay"].get("updated", 0)
+                affected_count += steps["decay"].get("processed", 0)
             if "creative" in steps:
                 affected_count += steps["creative"].get("created", 0)
             if "cluster" in steps:
                 affected_count += steps["cluster"].get("meta_memories_created", 0)
             if "forget" in steps:
-                affected_count += steps["forget"].get("archived", 0)
-                affected_count += steps["forget"].get("deleted", 0)
+                # Forgetting reports the affected memories as lists, not counts.
+                affected_count += len(steps["forget"].get("archived", []))
+                affected_count += len(steps["forget"].get("deleted", []))
             if "identity" in steps:
                 affected_count += steps["identity"].get("identities_synthesized", 0)
                 affected_count += len(steps["identity"].get("merges_performed", []))
