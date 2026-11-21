@@ -210,6 +210,35 @@ def test_reembedding_script_preserves_graph_state(monkeypatch):
     assert payload["tag_prefixes"] == ["auth", "auth:login"]
 
 
+def test_reembedding_script_placeholder_only_targets_placeholder_points(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts/reembed_embeddings.py"
+    spec = importlib.util.spec_from_file_location("reembed_placeholder_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    memories = [{"id": "keep"}, {"id": "fix"}]
+    qdrant = Mock()
+    seen = {}
+    monkeypatch.setattr(module, "load_environment", lambda: None)
+    monkeypatch.setattr(module, "_init_provider", lambda: "provider")
+    monkeypatch.setattr(module, "get_graph", lambda: "graph")
+    monkeypatch.setattr(module, "get_qdrant_client", lambda: qdrant)
+    monkeypatch.setattr(module, "fetch_memories", lambda graph, limit=None: memories)
+    monkeypatch.setattr(module, "find_placeholder_point_ids", lambda client, name: ["fix"])
+    monkeypatch.setattr(
+        module,
+        "reembed_memories",
+        lambda selected, batch_size, provider: seen.update(selected=selected),
+    )
+    monkeypatch.setattr("sys.argv", ["reembed_embeddings.py", "--placeholder-only"])
+
+    module.main()
+
+    assert seen["selected"] == [{"id": "fix"}]
+
+
 def test_deleted_memory_is_skipped_without_retry():
     impl = partial(
         store_embedding_in_qdrant,

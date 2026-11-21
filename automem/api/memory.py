@@ -536,9 +536,39 @@ def create_memory_blueprint_full(
     logger: Any,
     on_access: Optional[Callable[[List[str]], None]] = None,
     get_openai_client: Optional[Callable[[], Any]] = None,
-    generate_real_embeddings_batch: Optional[Callable[[List[str]], List[List[float]]]] = None,
+    generate_real_embeddings_batch: Optional[Callable[..., List[Optional[List[float]]]]] = None,
 ) -> Blueprint:
     bp = Blueprint("memory", __name__)
+
+    def _provider_embeddings(contents: List[str]) -> List[Optional[List[float]]]:
+        """Embed with the configured provider only, never substituting placeholders.
+
+        A deliberately configured placeholder provider is still accepted. Items the
+        provider could not embed come back as None so callers queue them for the
+        embedding worker instead of storing a vector that semantic search cannot use.
+        """
+        if not contents:
+            return []
+        if generate_real_embeddings_batch is None:
+            return [None] * len(contents)
+        try:
+            vectors = generate_real_embeddings_batch(
+                contents,
+                allow_placeholder_fallback=False,
+                allow_placeholder_provider=True,
+                allow_partial=True,
+            )
+        except Exception:
+            logger.exception("Provider embedding failed; queuing %d item(s)", len(contents))
+            return [None] * len(contents)
+        if len(vectors) != len(contents):
+            logger.warning(
+                "Embedding provider returned %d vectors for %d contents; queuing all",
+                len(vectors),
+                len(contents),
+            )
+            return [None] * len(contents)
+        return list(vectors)
 
     @bp.route("/memory", methods=["POST"])
     def store() -> Any:
@@ -1036,9 +1066,8 @@ def create_memory_blueprint_full(
         qdrant_client = get_qdrant_client()
         vector = None
         if qdrant_client is not None:
-            if new_content != current.get("content"):
-                vector = generate_real_embedding(new_content)
-            else:
+            needs_embedding = new_content != current.get("content")
+            if not needs_embedding:
                 try:
                     existing = qdrant_client.retrieve(
                         collection_name=collection_name,
@@ -1049,27 +1078,31 @@ def create_memory_blueprint_full(
                         vector = existing[0].vector
                 except Exception:
                     logger.exception("Failed to retrieve existing vector; regenerating")
-                    vector = generate_real_embedding(new_content)
+                    needs_embedding = True
+            queued_embedding = False
+            if needs_embedding:
+                vector = _provider_embeddings([new_content])[0]
+                queued_embedding = vector is None
 
+            payload = build_qdrant_payload(
+                {
+                    "archived": current.get("archived", False),
+                    "relevance_score": current.get("relevance_score"),
+                    "content": new_content,
+                    "tags": tags,
+                    "tag_prefixes": tag_prefixes,
+                    "importance": importance,
+                    "timestamp": timestamp,
+                    "type": memory_type,
+                    "confidence": confidence,
+                    "t_valid": t_valid,
+                    "t_invalid": t_invalid,
+                    "updated_at": updated_at,
+                    "last_accessed": last_accessed,
+                    "metadata": metadata,
+                }
+            )
             if vector is not None:
-                payload = build_qdrant_payload(
-                    {
-                        "archived": current.get("archived", False),
-                        "relevance_score": current.get("relevance_score"),
-                        "content": new_content,
-                        "tags": tags,
-                        "tag_prefixes": tag_prefixes,
-                        "importance": importance,
-                        "timestamp": timestamp,
-                        "type": memory_type,
-                        "confidence": confidence,
-                        "t_valid": t_valid,
-                        "t_invalid": t_invalid,
-                        "updated_at": updated_at,
-                        "last_accessed": last_accessed,
-                        "metadata": metadata,
-                    }
-                )
                 try:
                     qdrant_client.upsert(
                         collection_name=collection_name,
@@ -1081,6 +1114,22 @@ def create_memory_blueprint_full(
                         memory_id,
                         collection_name,
                     )
+            elif queued_embedding:
+                # Never persist a placeholder. Refresh the payload so filters and
+                # removed fields take effect now; the worker replaces the vector.
+                try:
+                    qdrant_client.set_payload(
+                        collection_name=collection_name,
+                        payload=payload,
+                        points=[memory_id],
+                    )
+                except Exception:
+                    logger.exception(
+                        "Qdrant payload refresh failed for memory %s in collection %s",
+                        memory_id,
+                        collection_name,
+                    )
+                enqueue_embedding(memory_id, new_content)
 
         emit_event(
             "memory.update",
@@ -1427,33 +1476,9 @@ def create_memory_blueprint_full(
 
         # 2. Batch embed all contents
         contents = [v["content"] for v in validated]
-        embeddings: List[Optional[List[float]]] = [None] * len(validated)
-
-        if generate_real_embeddings_batch:
-            try:
-                batch_result = generate_real_embeddings_batch(contents)
-                if len(batch_result) != len(contents):
-                    logger.warning(
-                        "Batch embedding returned %d vectors for %d contents, falling back",
-                        len(batch_result),
-                        len(contents),
-                    )
-                    raise ValueError("embedding count mismatch")
-                embeddings = batch_result
-            except Exception:
-                logger.exception("Batch embedding failed, falling back to individual")
-                for j, c in enumerate(contents):
-                    try:
-                        embeddings[j] = generate_real_embedding(c)
-                    except Exception as e:
-                        logger.warning("Individual embedding failed for item %d: %s", j, e)
-        else:
-            # Fall back to individual embedding calls
-            for j, c in enumerate(contents):
-                try:
-                    embeddings[j] = generate_real_embedding(c)
-                except Exception as e:
-                    logger.warning("Individual embedding failed for item %d: %s", j, e)
+        # Items the provider could not embed stay None and are queued for the
+        # embedding worker below; placeholder vectors are never stored for them.
+        embeddings = _provider_embeddings(contents)
 
         # 3. Batch graph write via UNWIND
         graph = get_memory_graph()

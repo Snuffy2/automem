@@ -6,7 +6,10 @@ Ollama, FastEmbed, etc.), so whatever provider you have configured will be
 used automatically.
 
 Usage:
-    python scripts/reembed_embeddings.py [--batch-size 32] [--limit 0]
+    python scripts/reembed_embeddings.py [--batch-size 32] [--limit 0] [--placeholder-only]
+
+``--placeholder-only`` re-embeds just the memories whose Qdrant vector is the
+deterministic hash placeholder for their content, leaving real embeddings alone.
 
 Environment:
     EMBEDDING_PROVIDER: Provider selection (default: auto)
@@ -35,6 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from automem.config import EMBEDDING_MODEL, VECTOR_SIZE
+from automem.stores.placeholder_points import find_placeholder_point_ids
 from automem.stores.vector_payload import build_qdrant_payload
 
 logger = logging.getLogger("reembed")
@@ -224,6 +228,11 @@ def main() -> None:
     parser.add_argument(
         "--limit", type=int, default=0, help="Optional limit of memories to process"
     )
+    parser.add_argument(
+        "--placeholder-only",
+        action="store_true",
+        help="Only re-embed memories whose Qdrant vector is a hash placeholder",
+    )
     args = parser.parse_args()
 
     load_environment()
@@ -232,7 +241,18 @@ def main() -> None:
 
     graph = get_graph()
     limit = args.limit if args.limit > 0 else None
-    memories = fetch_memories(graph, limit=limit)
+    if args.placeholder_only:
+        qdrant = get_qdrant_client()
+        if qdrant is None:
+            raise SystemExit(1)
+        collection = os.getenv("QDRANT_COLLECTION", "memories")
+        placeholder_ids = set(find_placeholder_point_ids(qdrant, collection))
+        logger.info("Found %d placeholder vectors in '%s'", len(placeholder_ids), collection)
+        memories = [m for m in fetch_memories(graph) if str(m["id"]) in placeholder_ids]
+        if limit is not None:
+            memories = memories[:limit]
+    else:
+        memories = fetch_memories(graph, limit=limit)
     if not memories:
         logger.info("No memories found")
         return

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import random
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Sequence
 
 
 def normalize_tags(value: Any) -> List[str]:
@@ -55,6 +56,34 @@ def generate_placeholder_embedding(content: str, expected_dim: int) -> List[floa
     return [rng.random() for _ in range(expected_dim)]
 
 
+def is_placeholder_vector(vector: Sequence[float], content: str) -> bool:
+    """Return whether ``vector`` is the deterministic placeholder for ``content``.
+
+    Placeholder vectors are seeded from the content hash, so a stored point can be
+    identified without extra payload. Comparison uses cosine similarity because a
+    cosine-distance collection may store normalized vectors.
+
+    Args:
+        vector: Stored vector to inspect.
+        content: Text the vector was written for.
+
+    Returns:
+        True when the vector matches the placeholder for that text.
+    """
+    if not vector or not isinstance(content, str):
+        return False
+    expected = generate_placeholder_embedding(content, len(vector))
+    try:
+        dot = sum(float(a) * b for a, b in zip(vector, expected))
+        norm = math.sqrt(sum(float(a) * float(a) for a in vector))
+    except (TypeError, ValueError):
+        return False
+    expected_norm = math.sqrt(sum(b * b for b in expected))
+    if norm == 0 or expected_norm == 0:
+        return False
+    return dot / (norm * expected_norm) >= 1 - 1e-6
+
+
 def generate_real_embedding(
     content: str,
     *,
@@ -101,8 +130,27 @@ def generate_real_embeddings_batch(
     placeholder_embedding: Callable[[str], List[float]],
     allow_placeholder_fallback: bool = True,
     allow_placeholder_provider: bool = False,
-) -> List[List[float]]:
-    """Generate multiple embeddings in a single batch for efficiency."""
+    allow_partial: bool = False,
+) -> List[Optional[List[float]]]:
+    """Generate multiple embeddings in a single batch for efficiency.
+
+    Args:
+        contents: Texts to embed.
+        init_embedding_provider: Lazily initializes ``state.embedding_provider``.
+        state: Service state holding the provider and effective vector size.
+        logger: Logger for fallback diagnostics.
+        placeholder_embedding: Deterministic placeholder generator.
+        allow_placeholder_fallback: Substitute placeholder vectors when the provider
+            is missing or fails. When False, failures raise instead.
+        allow_placeholder_provider: In strict mode, accept a deliberately configured
+            placeholder provider.
+        allow_partial: In strict mode, return None for items whose per-item provider
+            call failed instead of raising, so callers can keep the successful
+            vectors and queue the rest for retry.
+
+    Returns:
+        One vector per input; entries are None only when ``allow_partial`` is set.
+    """
     init_embedding_provider()
 
     if not contents:
@@ -148,8 +196,9 @@ def generate_real_embeddings_batch(
 
     # Per-item fallback: single-input calls may succeed even when the batch
     # endpoint fails (e.g. Voyage hanging on multi-input requests).
-    results: List[List[float]] = []
+    results: List[Optional[List[float]]] = []
     placeholder_count = 0
+    missing_count = 0
     for content in contents:
         try:
             embedding = provider.generate_embedding(content)
@@ -160,6 +209,11 @@ def generate_real_embeddings_batch(
                 )
             results.append(embedding)
         except Exception as exc:
+            if not allow_placeholder_fallback and allow_partial:
+                logger.debug("Per-item embedding failed (%s); leaving item unembedded", exc)
+                results.append(None)
+                missing_count += 1
+                continue
             if not allow_placeholder_fallback:
                 raise RuntimeError(
                     f"Failed to generate provider embedding for item "
@@ -175,5 +229,12 @@ def generate_real_embeddings_batch(
             "invisible to semantic search until re-embedded",
             placeholder_count,
             len(contents),
+        )
+    if missing_count:
+        logger.warning(
+            "%d/%d items could not be embedded by provider %s; callers must retry them",
+            missing_count,
+            len(contents),
+            provider_name,
         )
     return results

@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from flask import Blueprint, abort, jsonify, request
 
 from automem.config import RECALL_EXCLUDED_TYPES
+from automem.stores.placeholder_points import find_placeholder_point_ids
 from automem.stores.vector_payload import build_qdrant_payload
 from automem.sync.accounting import fetch_falkor_memory_ids, fetch_qdrant_point_ids
 
@@ -77,14 +78,44 @@ def create_admin_blueprint_full(
             batch_size = 32
         limit = payload.get("limit")
         force_reembed = bool(payload.get("force", False))
+        placeholder_only = bool(payload.get("placeholder_only", False))
 
         graph = get_memory_graph()
         if graph is None:
             abort(503, description="FalkorDB is unavailable")
 
+        placeholder_ids: List[str] = []
+        if placeholder_only:
+            # Repair only points whose vector is the hash placeholder for their
+            # content; real embeddings are left untouched.
+            try:
+                placeholder_ids = find_placeholder_point_ids(qdrant_client, collection_name)
+            except Exception:
+                logger.exception("Failed to scan Qdrant for placeholder vectors")
+                abort(503, description="Failed to scan Qdrant for placeholder vectors")
+            if not placeholder_ids:
+                return jsonify(
+                    {
+                        "status": "complete",
+                        "message": "No placeholder vectors found",
+                        "placeholder_only": True,
+                        "processed": 0,
+                        "total": 0,
+                    }
+                )
+
         # Fetch full memory data from FalkorDB (not just id and content)
-        base_query = """
+        conditions: List[str] = []
+        query_params: Dict[str, Any] = {}
+        if not force_reembed:
+            conditions.append("m.content IS NOT NULL")
+        if placeholder_only:
+            conditions.append("m.id IN $ids")
+            query_params["ids"] = placeholder_ids
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        base_query = f"""
             MATCH (m:Memory)
+            {where_clause}
             RETURN m.id AS id,
                    m.content AS content,
                    m.tags AS tags,
@@ -101,33 +132,13 @@ def create_admin_blueprint_full(
                    m.relevance_score AS relevance_score
             ORDER BY m.timestamp DESC
         """
-        if not force_reembed:
-            base_query = """
-                MATCH (m:Memory)
-                WHERE m.content IS NOT NULL
-                RETURN m.id AS id,
-                       m.content AS content,
-                       m.tags AS tags,
-                       m.importance AS importance,
-                       m.timestamp AS timestamp,
-                       m.type AS type,
-                       m.confidence AS confidence,
-                       m.metadata AS metadata,
-                       m.updated_at AS updated_at,
-                       m.last_accessed AS last_accessed,
-                       m.t_valid AS t_valid,
-                       m.t_invalid AS t_invalid,
-                       m.archived AS archived,
-                       m.relevance_score AS relevance_score
-                ORDER BY m.timestamp DESC
-            """
         if limit:
             try:
                 base_query += f" LIMIT {int(limit)}"
             except (TypeError, ValueError):
                 pass
 
-        result = graph.query(base_query)
+        result = graph.query(base_query, query_params)
         to_process: List[Dict[str, Any]] = []
         for row in getattr(result, "result_set", []) or []:
             memory_id = row[0]
@@ -207,6 +218,9 @@ def create_admin_blueprint_full(
             "batch_size": batch_size,
             "metadata_preserved": True,
         }
+        if placeholder_only:
+            response["placeholder_only"] = True
+            response["placeholder_points"] = len(placeholder_ids)
         if failed_ids:
             response["failed_ids"] = failed_ids[:10]
             if len(failed_ids) > 10:
